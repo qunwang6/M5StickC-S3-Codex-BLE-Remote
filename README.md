@@ -76,3 +76,5 @@ ls /dev/cu.*
 - `platformio.ini`：PlatformIO 配置
 
 当前 PlatformIO 构建使用 `USE_NIMBLE`，用于 BLE HID 键盘连接。
+
+
