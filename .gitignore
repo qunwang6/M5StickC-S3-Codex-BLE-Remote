@@ -1,0 +1,18 @@
+# PlatformIO build output
+.pio/
+
+# Local PlatformIO core/cache used by the documented commands
+.platformio-core/
+
+# macOS
+.DS_Store
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+*.tmp
