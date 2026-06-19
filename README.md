@@ -23,7 +23,7 @@ M5StickC S3 通过 BLE 模拟蓝牙键盘，用来控制 macOS 命令行里的 C
 ## 命令行编译
 
 ```bash
-cd /Users/qun/Downloads/ESP32S3_Codex_BLE_Button
+cd M5StickC-S3-Codex-BLE-Remote
 PLATFORMIO_CORE_DIR=.platformio-core pio run
 ```
 
@@ -32,14 +32,14 @@ PLATFORMIO_CORE_DIR=.platformio-core pio run
 自动选择串口：
 
 ```bash
-cd /Users/qun/Downloads/ESP32S3_Codex_BLE_Button
+cd M5StickC-S3-Codex-BLE-Remote
 PLATFORMIO_CORE_DIR=.platformio-core pio run -t upload
 ```
 
 指定串口：
 
 ```bash
-cd /Users/qun/Downloads/ESP32S3_Codex_BLE_Button
+cd M5StickC-S3-Codex-BLE-Remote
 PLATFORMIO_CORE_DIR=.platformio-core pio run -t upload --upload-port /dev/cu.usbmodem101
 ```
 
@@ -76,5 +76,4 @@ ls /dev/cu.*
 - `platformio.ini`：PlatformIO 配置
 
 当前 PlatformIO 构建使用 `USE_NIMBLE`，用于 BLE HID 键盘连接。
-
 
