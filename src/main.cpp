@@ -1,7 +1,19 @@
 #include <Arduino.h>
 #include <BleKeyboard.h>
+#include <DNSServer.h>
 #include <M5Unified.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <WiFi.h>
+
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
 
 volatile bool callbackConnected = false;
 volatile bool gapConnected = false;
@@ -28,14 +40,27 @@ protected:
 };
 
 CodexBleKeyboard bleKeyboard("CodexBtn-S3", "ESP32-S3", 100);
+DNSServer dnsServer;
+WebServer webServer(80);
 
+const char *PREF_NAMESPACE = "codex-remote";
+const char *PREF_WIFI_ENABLED = "wifi_on";
+const char *PREF_WIFI_SSID = "wifi_ssid";
+const char *PREF_WIFI_PASSWORD = "wifi_pass";
+const char *WIFI_SETUP_AP_SSID = "CodexBtn-Setup";
+const IPAddress WIFI_SETUP_IP(192, 168, 4, 1);
+const IPAddress WIFI_SETUP_GATEWAY(192, 168, 4, 1);
+const IPAddress WIFI_SETUP_SUBNET(255, 255, 255, 0);
 const int BUTTON_PIN = 0;
 const int RAW_BTN_A_PIN = 11;
+const int RAW_BTN_B_PIN = 12;
 const unsigned long DEBOUNCE_MS = 50;
 const unsigned long MESSAGE_HOLD_MS = 800;
 const unsigned long FACE_DOWN_CHECK_MS = 200;
 const unsigned long AUTO_SCREEN_OFF_MS = 30000;
 const unsigned long MENU_LONG_PRESS_MS = 700;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
+const int MENU_ITEM_COUNT = 4;
 const int BATTERY_REDRAW_DELTA = 5;
 const uint8_t DISPLAY_BRIGHTNESS = 120;
 const float FACE_DOWN_Z_THRESHOLD = -0.75f;
@@ -44,6 +69,8 @@ const uint16_t UI_BACKGROUND_COLOR = 0x4372; // #476f95 in RGB565
 const uint16_t UI_TEXT_COLOR = 0xD6DC;       // #d1dbe4 in RGB565
 
 int bleGapEventHandler(ble_gap_event *event, void *arg);
+bool isWifiConfigured();
+String stopWifiSetupPortal();
 void drawStatus(bool connected, const String &message);
 
 enum UiMode {
@@ -51,22 +78,31 @@ enum UiMode {
   UI_MENU
 };
 
-bool lastReading = HIGH;
-bool stableState = HIGH;
-bool handledPress = false;
-unsigned long lastChangeMs = 0;
+bool enterLastReading = HIGH;
+bool enterStableState = HIGH;
+unsigned long enterLastChangeMs = 0;
+bool menuLastReading = HIGH;
+bool menuStableState = HIGH;
+bool menuHandledPress = false;
+unsigned long menuLastChangeMs = 0;
 unsigned long messageHoldUntilMs = 0;
 unsigned long lastActivityMs = 0;
 unsigned long lastFaceDownCheckMs = 0;
 bool lastConnected = false;
 String lastMessage = "";
+String lastWifiInfo = "";
 bool displayOn = true;
 bool faceDown = false;
 bool bleStarted = false;
+bool wifiEnabled = false;
+bool wifiSetupActive = false;
+bool wifiRoutesRegistered = false;
+String wifiSsid = WIFI_SSID;
+String wifiPassword = WIFI_PASSWORD;
 int lastBatteryLevel = -100;
 UiMode uiMode = UI_STATUS;
 int menuSelection = 0;
-bool enterReleasePending = false;
+bool menuReleasePending = false;
 
 int readBatteryLevel() {
   int level = M5.Power.getBatteryLevel();
@@ -84,11 +120,78 @@ void drawBluetoothIcon(int x, int y, bool connected) {
   M5.Display.drawLine(x, y + 11, x + 12, y + 4, color);
 }
 
-String bleStatusLabel(bool connected) {
-  if (!bleStarted) {
-    return "OFF";
+void drawWifiIcon(int x, int y) {
+  bool connected = WiFi.status() == WL_CONNECTED;
+  uint16_t color = connected ? TFT_GREEN : (wifiSetupActive ? TFT_YELLOW : UI_TEXT_COLOR);
+
+  M5.Display.drawArc(x + 8, y + 13, 12, 11, 220, 320, color);
+  M5.Display.drawArc(x + 8, y + 13, 8, 7, 225, 315, color);
+  M5.Display.drawArc(x + 8, y + 13, 4, 3, 235, 305, color);
+  M5.Display.fillCircle(x + 8, y + 13, 1, color);
+  if (!connected && !wifiSetupActive) {
+    M5.Display.drawLine(x + 1, y + 2, x + 15, y + 14, color);
   }
-  return connected ? "ON" : "READY";
+}
+
+String fitTextToWidth(const String &text, int maxWidth) {
+  if (M5.Display.textWidth(text) <= maxWidth) {
+    return text;
+  }
+
+  String shortened = text;
+  while (shortened.length() > 1 && M5.Display.textWidth(shortened + "...") > maxWidth) {
+    shortened.remove(shortened.length() - 1);
+  }
+  return shortened + "...";
+}
+
+String wifiInfoText() {
+  if (wifiSetupActive) {
+    return "WiFi setup: " + String(WIFI_SETUP_AP_SSID);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    return "WiFi: " + WiFi.SSID() + " " + WiFi.localIP().toString();
+  }
+  if (wifiEnabled && isWifiConfigured()) {
+    return "WiFi: connecting " + wifiSsid;
+  }
+  if (isWifiConfigured()) {
+    return "WiFi saved: " + wifiSsid;
+  }
+  return "WiFi: off";
+}
+
+String wifiInfoTitle() {
+  if (wifiSetupActive) {
+    return "WiFi setup";
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    return "WiFi connected";
+  }
+  if (wifiEnabled && isWifiConfigured()) {
+    return "WiFi connecting";
+  }
+  if (isWifiConfigured()) {
+    return "WiFi saved";
+  }
+  return "WiFi off";
+}
+
+String wifiInfoDetail() {
+  if (wifiSetupActive) {
+    return String(WIFI_SETUP_AP_SSID) + " " + WIFI_SETUP_IP.toString();
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    return WiFi.SSID() + " " + WiFi.localIP().toString();
+  }
+  if (isWifiConfigured()) {
+    return wifiSsid;
+  }
+  return "No saved network";
+}
+
+bool isWifiActive() {
+  return wifiSetupActive || wifiEnabled || WiFi.status() == WL_CONNECTED;
 }
 
 bool isBleActuallyConnected() {
@@ -148,6 +251,268 @@ void reconnectBle() {
   messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
 }
 
+void loadWifiSettings() {
+  Preferences prefs;
+  prefs.begin(PREF_NAMESPACE, true);
+  wifiEnabled = prefs.getBool(PREF_WIFI_ENABLED, false);
+  wifiSsid = prefs.getString(PREF_WIFI_SSID, WIFI_SSID);
+  wifiPassword = prefs.getString(PREF_WIFI_PASSWORD, WIFI_PASSWORD);
+  prefs.end();
+}
+
+void saveWifiSettings() {
+  Preferences prefs;
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.putBool(PREF_WIFI_ENABLED, wifiEnabled);
+  prefs.putString(PREF_WIFI_SSID, wifiSsid);
+  prefs.putString(PREF_WIFI_PASSWORD, wifiPassword);
+  prefs.end();
+}
+
+bool isWifiConfigured() {
+  return wifiSsid.length() > 0;
+}
+
+String connectWifi() {
+  if (!isWifiConfigured()) {
+    wifiEnabled = false;
+    saveWifiSettings();
+    return "WiFi not configured";
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(false, false);
+    delay(100);
+  }
+
+  WiFi.mode(wifiSetupActive ? WIFI_AP_STA : WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
+    M5.update();
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiEnabled = true;
+    saveWifiSettings();
+    return "WiFi " + WiFi.localIP().toString();
+  }
+
+  wifiEnabled = false;
+  saveWifiSettings();
+  return "WiFi connect failed";
+}
+
+String disableWifi() {
+  wifiEnabled = false;
+  saveWifiSettings();
+
+  if (wifiSetupActive) {
+    stopWifiSetupPortal();
+  } else if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(false, false);
+  }
+
+  WiFi.mode(WIFI_OFF);
+  return "WiFi off";
+}
+
+String htmlEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length());
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    switch (c) {
+      case '&':
+        escaped += F("&amp;");
+        break;
+      case '<':
+        escaped += F("&lt;");
+        break;
+      case '>':
+        escaped += F("&gt;");
+        break;
+      case '"':
+        escaped += F("&quot;");
+        break;
+      case '\'':
+        escaped += F("&#39;");
+        break;
+      default:
+        escaped += c;
+        break;
+    }
+  }
+  return escaped;
+}
+
+String wifiStatusText() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return "Connected to " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")";
+  }
+  if (isWifiConfigured()) {
+    return "Saved network: " + wifiSsid;
+  }
+  return "No saved WiFi";
+}
+
+String buildWifiSetupPage(const String &notice = "") {
+  int networks = WiFi.scanNetworks(false, true);
+  String page;
+  page.reserve(6000);
+  page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<title>CodexBtn WiFi</title><style>");
+  page += F("body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;background:#f6f8fb;color:#17202a}");
+  page += F("main{max-width:560px;margin:auto;background:white;border:1px solid #d8dee8;border-radius:8px;padding:20px}");
+  page += F("h1{font-size:22px;margin:0 0 8px}label{display:block;margin:14px 0 6px;font-weight:600}");
+  page += F("select,input,button{box-sizing:border-box;width:100%;font-size:16px;padding:10px;border-radius:6px;border:1px solid #b8c2d2}");
+  page += F("button{margin-top:16px;background:#155eef;color:white;border-color:#155eef;font-weight:700}");
+  page += F(".muted{color:#5b6675;font-size:14px}.notice{background:#eaf2ff;border:1px solid #b8d2ff;border-radius:6px;padding:10px;margin:12px 0}");
+  page += F("</style></head><body><main><h1>CodexBtn WiFi Setup</h1>");
+  page += F("<p class='muted'>Connect this device to your local WiFi.</p><p class='muted'>Status: ");
+  page += htmlEscape(wifiStatusText());
+  page += F("</p>");
+  if (notice.length()) {
+    page += F("<div class='notice'>");
+    page += htmlEscape(notice);
+    page += F("</div>");
+  }
+  page += F("<form method='post' action='/save'><label for='ssid'>Network</label><select id='ssid' name='ssid'>");
+  if (wifiSsid.length()) {
+    page += F("<option selected value='");
+    page += htmlEscape(wifiSsid);
+    page += F("'>Saved: ");
+    page += htmlEscape(wifiSsid);
+    page += F("</option>");
+  }
+  for (int i = 0; i < networks; ++i) {
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length()) {
+      continue;
+    }
+    page += F("<option value='");
+    page += htmlEscape(ssid);
+    page += F("'>");
+    page += htmlEscape(ssid);
+    page += F(" (");
+    page += String(WiFi.RSSI(i));
+    page += F(" dBm");
+    page += WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? F(", open") : F(", secured");
+    page += F(")</option>");
+  }
+  WiFi.scanDelete();
+  page += F("</select><label for='password'>Password</label>");
+  page += F("<input id='password' name='password' type='password' placeholder='Leave blank for open networks'>");
+  page += F("<button type='submit'>Save and Connect</button></form>");
+  page += F("<form method='post' action='/forget'><button type='submit'>Forget Saved WiFi</button></form>");
+  page += F("<form method='get' action='/'><button type='submit'>Refresh Scan</button></form>");
+  page += F("<p class='muted'>Setup AP: ");
+  page += WIFI_SETUP_AP_SSID;
+  page += F(" / ");
+  page += WIFI_SETUP_IP.toString();
+  page += F("</p></main></body></html>");
+  return page;
+}
+
+void handleWifiSetupRoot() {
+  webServer.send(200, "text/html", buildWifiSetupPage());
+}
+
+void handleWifiSave() {
+  String ssid = webServer.arg("ssid");
+  String password = webServer.arg("password");
+  ssid.trim();
+
+  if (!ssid.length()) {
+    webServer.send(400, "text/html", buildWifiSetupPage("SSID is required."));
+    return;
+  }
+
+  if (!password.length() && ssid == wifiSsid) {
+    password = wifiPassword;
+  }
+
+  wifiSsid = ssid;
+  wifiPassword = password;
+  wifiEnabled = true;
+  saveWifiSettings();
+
+  drawStatus(isBleActuallyConnected(), "WiFi connecting");
+  messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
+  String result = connectWifi();
+  webServer.send(200, "text/html", buildWifiSetupPage(result));
+  drawStatus(isBleActuallyConnected(), result);
+  messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
+}
+
+void handleWifiForget() {
+  wifiEnabled = false;
+  wifiSsid = "";
+  wifiPassword = "";
+  saveWifiSettings();
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(true, false);
+  }
+  webServer.send(200, "text/html", buildWifiSetupPage("Saved WiFi cleared."));
+}
+
+void handleWifiSetupNotFound() {
+  webServer.sendHeader("Location", "http://" + WIFI_SETUP_IP.toString() + "/", true);
+  webServer.send(302, "text/plain", "");
+}
+
+String startWifiSetupPortal() {
+  if (wifiSetupActive) {
+    return String("Setup ") + WIFI_SETUP_IP.toString();
+  }
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(WIFI_SETUP_IP, WIFI_SETUP_GATEWAY, WIFI_SETUP_SUBNET);
+  if (!WiFi.softAP(WIFI_SETUP_AP_SSID)) {
+    return "Setup AP failed";
+  }
+
+  dnsServer.start(53, "*", WIFI_SETUP_IP);
+  if (!wifiRoutesRegistered) {
+    webServer.on("/", HTTP_GET, handleWifiSetupRoot);
+    webServer.on("/save", HTTP_POST, handleWifiSave);
+    webServer.on("/forget", HTTP_POST, handleWifiForget);
+    webServer.onNotFound(handleWifiSetupNotFound);
+    wifiRoutesRegistered = true;
+  }
+  webServer.begin();
+  wifiSetupActive = true;
+  return String("AP ") + WIFI_SETUP_IP.toString();
+}
+
+String stopWifiSetupPortal() {
+  if (!wifiSetupActive) {
+    return "Setup off";
+  }
+
+  webServer.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  wifiSetupActive = false;
+  WiFi.mode(WiFi.status() == WL_CONNECTED ? WIFI_STA : WIFI_OFF);
+  return "Setup off";
+}
+
+String toggleWifiSetupPortal() {
+  return wifiSetupActive ? stopWifiSetupPortal() : startWifiSetupPortal();
+}
+
+void updateWifiSetupPortal() {
+  if (!wifiSetupActive) {
+    return;
+  }
+
+  dnsServer.processNextRequest();
+  webServer.handleClient();
+}
+
 void drawBatteryIcon(int x, int y, int level) {
   M5.Display.drawRoundRect(x, y, 28, 14, 2, UI_TEXT_COLOR);
   M5.Display.fillRect(x + 28, y + 4, 3, 6, UI_TEXT_COLOR);
@@ -181,8 +546,7 @@ void drawStatus(bool connected, const String &message) {
 
   M5.Display.setTextSize(1);
   drawBluetoothIcon(8, 4, connected);
-  M5.Display.setTextDatum(middle_left);
-  M5.Display.drawString(bleStatusLabel(connected), 25, 11);
+  drawWifiIcon(28, 3);
   M5.Display.setTextDatum(middle_center);
   drawBatteryIcon(w - 68, 4, readBatteryLevel());
 
@@ -190,12 +554,15 @@ void drawStatus(bool connected, const String &message) {
   M5.Display.drawString("ENTER", w / 2, h / 2 - 8);
 
   M5.Display.setTextSize(1);
+  M5.Display.drawString(fitTextToWidth(wifiInfoTitle(), w - 12), w / 2, h / 2 + 14);
+  M5.Display.drawString(fitTextToWidth(wifiInfoDetail(), w - 12), w / 2, h / 2 + 26);
   M5.Display.drawString(message, w / 2, h - 32);
-  M5.Display.drawString("A: send / hold menu", w / 2, h - 18);
-  M5.Display.drawString("B: down", w / 2, h - 6);
+  M5.Display.drawString("A: send", w / 2, h - 18);
+  M5.Display.drawString("B: down / hold menu", w / 2, h - 6);
 
   lastConnected = connected;
   lastMessage = message;
+  lastWifiInfo = wifiInfoText();
   lastBatteryLevel = readBatteryLevel();
 }
 
@@ -215,9 +582,16 @@ void drawMenu() {
   M5.Display.drawString("MENU", w / 2, 22);
 
   M5.Display.setTextSize(1);
-  String connectLabel = bleStarted ? "Reconnect BLE" : "Connect BLE";
-  M5.Display.drawString(String(menuSelection == 0 ? "> " : "  ") + connectLabel, w / 2, h / 2 - 10);
-  M5.Display.drawString(String(menuSelection == 1 ? "> " : "  ") + "Exit", w / 2, h / 2 + 12);
+  String bleLabel = bleStarted ? "Reconnect BLE" : "Connect BLE";
+  String wifiPowerLabel = isWifiActive() ? "WiFi off" : "WiFi on";
+  String setupLabel = wifiSetupActive ? "WiFi setup off" : "WiFi setup";
+  int menuX = 18;
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.drawString(String(menuSelection == 0 ? "> " : "  ") + bleLabel, menuX, h / 2 - 27);
+  M5.Display.drawString(String(menuSelection == 1 ? "> " : "  ") + wifiPowerLabel, menuX, h / 2 - 9);
+  M5.Display.drawString(String(menuSelection == 2 ? "> " : "  ") + setupLabel, menuX, h / 2 + 9);
+  M5.Display.drawString(String(menuSelection == 3 ? "> " : "  ") + "Exit", menuX, h / 2 + 27);
+  M5.Display.setTextDatum(middle_center);
   M5.Display.drawString("B: move  A: select", w / 2, h - 12);
 }
 
@@ -240,6 +614,7 @@ void setDisplayPower(bool on, const String &message = "") {
     applyDisplayRotation();
     M5.Display.setBrightness(DISPLAY_BRIGHTNESS);
     lastMessage = "";
+    lastWifiInfo = "";
     lastBatteryLevel = -100;
     drawStatus(isBleActuallyConnected(), message.length() ? message : "Screen on");
     messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
@@ -285,6 +660,7 @@ void refreshStatus(const String &message) {
 
   messageHoldUntilMs = 0;
   bool connected = isBleActuallyConnected();
+  String wifiInfo = wifiInfoText();
   int batteryLevel = readBatteryLevel();
   bool batteryChanged = lastBatteryLevel == -100 ||
                         (batteryLevel >= 0 && lastBatteryLevel >= 0 && abs(batteryLevel - lastBatteryLevel) >= BATTERY_REDRAW_DELTA) ||
@@ -293,6 +669,7 @@ void refreshStatus(const String &message) {
 
   if (connected != lastConnected ||
       message != lastMessage ||
+      wifiInfo != lastWifiInfo ||
       batteryChanged) {
     drawStatus(connected, message);
   }
@@ -300,7 +677,7 @@ void refreshStatus(const String &message) {
 
 void sendSelectedAction() {
   if (!bleStarted) {
-    drawStatus(false, "Hold A: BLE menu");
+    drawStatus(false, "Hold B: menu");
     messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
     return;
   }
@@ -320,7 +697,7 @@ void sendSelectedAction() {
 
 void sendDownAction() {
   if (!bleStarted) {
-    drawStatus(false, "Hold A: BLE menu");
+    drawStatus(false, "Hold B: menu");
     messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
     return;
   }
@@ -348,34 +725,63 @@ bool readEnterButtonPressed() {
          digitalRead(BUTTON_PIN) == LOW;
 }
 
-void updateEnterButton(bool &clicked, bool &longPressed) {
+bool readMenuButtonPressed() {
+  return M5.BtnB.isPressed() ||
+         digitalRead(RAW_BTN_B_PIN) == LOW;
+}
+
+void updateEnterButton(bool &clicked) {
   bool reading = readEnterButtonPressed() ? LOW : HIGH;
 
-  if (reading != lastReading) {
-    lastChangeMs = millis();
-    lastReading = reading;
+  if (reading != enterLastReading) {
+    enterLastChangeMs = millis();
+    enterLastReading = reading;
   }
 
-  if ((millis() - lastChangeMs) <= DEBOUNCE_MS) {
+  if ((millis() - enterLastChangeMs) <= DEBOUNCE_MS) {
     return;
   }
 
-  if (reading != stableState) {
-    stableState = reading;
+  if (reading != enterStableState) {
+    enterStableState = reading;
 
-    if (stableState == LOW) {
-      handledPress = false;
+    if (enterStableState == LOW) {
       return;
     }
 
-    if (!handledPress) {
+    clicked = true;
+    return;
+  }
+}
+
+void updateMenuButton(bool &clicked, bool &longPressed) {
+  bool reading = readMenuButtonPressed() ? LOW : HIGH;
+
+  if (reading != menuLastReading) {
+    menuLastChangeMs = millis();
+    menuLastReading = reading;
+  }
+
+  if ((millis() - menuLastChangeMs) <= DEBOUNCE_MS) {
+    return;
+  }
+
+  if (reading != menuStableState) {
+    menuStableState = reading;
+
+    if (menuStableState == LOW) {
+      menuHandledPress = false;
+      return;
+    }
+
+    if (!menuHandledPress) {
       clicked = true;
     }
     return;
   }
 
-  if (stableState == LOW && !handledPress && millis() - lastChangeMs >= MENU_LONG_PRESS_MS) {
-    handledPress = true;
+  if (menuStableState == LOW && !menuHandledPress && millis() - menuLastChangeMs >= MENU_LONG_PRESS_MS) {
+    menuHandledPress = true;
     longPressed = true;
   }
 }
@@ -399,7 +805,7 @@ void closeMenu(const String &message) {
 void handleMenu(bool moveClicked, bool selectClicked) {
   if (moveClicked) {
     noteActivity();
-    menuSelection = (menuSelection + 1) % 2;
+    menuSelection = (menuSelection + 1) % MENU_ITEM_COUNT;
     drawMenu();
     delay(120);
     return;
@@ -413,6 +819,25 @@ void handleMenu(bool moveClicked, bool selectClicked) {
   if (menuSelection == 0) {
     reconnectBle();
     closeMenu(bleStarted ? "BLE reconnecting" : "BLE off");
+    return;
+  }
+
+  if (menuSelection == 1) {
+    uiMode = UI_STATUS;
+    if (isWifiActive()) {
+      drawStatus(isBleActuallyConnected(), "WiFi stopping");
+      closeMenu(disableWifi());
+    } else {
+      drawStatus(isBleActuallyConnected(), "WiFi connecting");
+      closeMenu(connectWifi());
+    }
+    return;
+  }
+
+  if (menuSelection == 2) {
+    uiMode = UI_STATUS;
+    drawStatus(isBleActuallyConnected(), wifiSetupActive ? "Setup stopping" : "Setup starting");
+    closeMenu(toggleWifiSetupPortal());
     return;
   }
 
@@ -480,40 +905,51 @@ int bleGapEventHandler(ble_gap_event *event, void *arg) {
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
+  loadWifiSettings();
   setupDisplay();
   noteActivity();
   M5.update();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(RAW_BTN_A_PIN, INPUT_PULLUP);
+  pinMode(RAW_BTN_B_PIN, INPUT_PULLUP);
   delay(300);
   startBle();
+  if (wifiEnabled) {
+    drawStatus(isBleActuallyConnected(), "WiFi connecting");
+    messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
+    String wifiMessage = connectWifi();
+    drawStatus(isBleActuallyConnected(), wifiMessage);
+    messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
+  }
 }
 
 void loop() {
   M5.update();
+  updateWifiSetupPortal();
 
   enforceDisplayOff();
   if (uiMode != UI_MENU) {
     updateFaceDownDisplayState();
   }
 
-  bool selectClicked = M5.BtnB.wasClicked();
   bool middleClicked = false;
-  bool middleLongPressed = false;
-  updateEnterButton(middleClicked, middleLongPressed);
+  bool rightClicked = false;
+  bool rightLongPressed = false;
+  updateEnterButton(middleClicked);
+  updateMenuButton(rightClicked, rightLongPressed);
 
-  if (middleLongPressed) {
+  if (rightLongPressed) {
     noteActivity();
-    enterReleasePending = true;
+    menuReleasePending = true;
     openMenu();
     delay(5);
     return;
   }
 
-  if (enterReleasePending) {
-    if (!readEnterButtonPressed()) {
-      enterReleasePending = false;
+  if (menuReleasePending) {
+    if (!readMenuButtonPressed()) {
+      menuReleasePending = false;
     }
     if (uiMode == UI_MENU) {
       delay(5);
@@ -522,14 +958,14 @@ void loop() {
   }
 
   if (uiMode == UI_MENU) {
-    handleMenu(selectClicked, middleClicked);
+    handleMenu(rightClicked, middleClicked);
     delay(5);
     return;
   }
 
   bool sendClicked = middleClicked;
 
-  if (selectClicked) {
+  if (rightClicked) {
     noteActivity();
     sendDownAction();
   }
