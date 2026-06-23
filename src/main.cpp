@@ -145,6 +145,22 @@ String fitTextToWidth(const String &text, int maxWidth) {
   return shortened + "...";
 }
 
+bool hasNonAscii(const String &text) {
+  for (size_t i = 0; i < text.length(); ++i) {
+    if (static_cast<uint8_t>(text[i]) > 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+String screenSsidText(const String &ssid) {
+  if (!ssid.length()) {
+    return "SSID hidden";
+  }
+  return ssid;
+}
+
 String wifiInfoText() {
   if (wifiSetupActive) {
     return "WiFi setup: " + String(WIFI_SETUP_AP_SSID);
@@ -163,7 +179,7 @@ String wifiInfoText() {
 
 String wifiInfoTitle() {
   if (wifiSetupActive) {
-    return "WiFi setup";
+    return "Setup AP";
   }
   if (WiFi.status() == WL_CONNECTED) {
     return "WiFi connected";
@@ -179,15 +195,47 @@ String wifiInfoTitle() {
 
 String wifiInfoDetail() {
   if (wifiSetupActive) {
-    return String(WIFI_SETUP_AP_SSID) + " " + WIFI_SETUP_IP.toString();
+    return WIFI_SETUP_IP.toString();
   }
   if (WiFi.status() == WL_CONNECTED) {
-    return WiFi.SSID() + " " + WiFi.localIP().toString();
+    return screenSsidText(WiFi.SSID());
   }
   if (isWifiConfigured()) {
-    return wifiSsid;
+    return screenSsidText(wifiSsid);
   }
   return "No saved network";
+}
+
+String wifiInfoIp() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return WiFi.localIP().toString();
+  }
+  return "";
+}
+
+String footerText(const String &message) {
+  if (message == "Ready: Enter / Down") {
+    return message;
+  }
+  if (message == "WiFi connecting") {
+    return "WiFi conn";
+  }
+  if (message == "WiFi connect failed") {
+    return "WiFi fail";
+  }
+  if (message == "WiFi not configured") {
+    return "No WiFi";
+  }
+  if (message == "WiFi stopping") {
+    return "WiFi off...";
+  }
+  if (message == "Setup starting") {
+    return "Setup on...";
+  }
+  if (message == "Setup stopping") {
+    return "Setup off...";
+  }
+  return message;
 }
 
 bool isWifiActive() {
@@ -362,7 +410,7 @@ String buildWifiSetupPage(const String &notice = "") {
   int networks = WiFi.scanNetworks(false, true);
   String page;
   page.reserve(6000);
-  page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<title>CodexBtn WiFi</title><style>");
   page += F("body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;background:#f6f8fb;color:#17202a}");
   page += F("main{max-width:560px;margin:auto;background:white;border:1px solid #d8dee8;border-radius:8px;padding:20px}");
@@ -417,7 +465,7 @@ String buildWifiSetupPage(const String &notice = "") {
 }
 
 void handleWifiSetupRoot() {
-  webServer.send(200, "text/html", buildWifiSetupPage());
+  webServer.send(200, "text/html; charset=utf-8", buildWifiSetupPage());
 }
 
 void handleWifiSave() {
@@ -426,7 +474,7 @@ void handleWifiSave() {
   ssid.trim();
 
   if (!ssid.length()) {
-    webServer.send(400, "text/html", buildWifiSetupPage("SSID is required."));
+    webServer.send(400, "text/html; charset=utf-8", buildWifiSetupPage("SSID is required."));
     return;
   }
 
@@ -442,7 +490,7 @@ void handleWifiSave() {
   drawStatus(isBleActuallyConnected(), "WiFi connecting");
   messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
   String result = connectWifi();
-  webServer.send(200, "text/html", buildWifiSetupPage(result));
+  webServer.send(200, "text/html; charset=utf-8", buildWifiSetupPage(result));
   drawStatus(isBleActuallyConnected(), result);
   messageHoldUntilMs = millis() + MESSAGE_HOLD_MS;
 }
@@ -455,7 +503,7 @@ void handleWifiForget() {
   if (WiFi.status() == WL_CONNECTED) {
     WiFi.disconnect(true, false);
   }
-  webServer.send(200, "text/html", buildWifiSetupPage("Saved WiFi cleared."));
+  webServer.send(200, "text/html; charset=utf-8", buildWifiSetupPage("Saved WiFi cleared."));
 }
 
 void handleWifiSetupNotFound() {
@@ -551,14 +599,22 @@ void drawStatus(bool connected, const String &message) {
   drawBatteryIcon(w - 68, 4, readBatteryLevel());
 
   M5.Display.setTextSize(3);
-  M5.Display.drawString("ENTER", w / 2, h / 2 - 8);
+  M5.Display.drawString("ENTER", w / 2, h / 2 - 15);
 
   M5.Display.setTextSize(1);
-  M5.Display.drawString(fitTextToWidth(wifiInfoTitle(), w - 12), w / 2, h / 2 + 14);
-  M5.Display.drawString(fitTextToWidth(wifiInfoDetail(), w - 12), w / 2, h / 2 + 26);
-  M5.Display.drawString(message, w / 2, h - 32);
-  M5.Display.drawString("A: send", w / 2, h - 18);
-  M5.Display.drawString("B: down / hold menu", w / 2, h - 6);
+  M5.Display.drawString(fitTextToWidth(wifiInfoTitle(), w - 12), w / 2, h / 2 + 8);
+  M5.Display.setFont(&fonts::efontCN_10);
+  M5.Display.drawString(fitTextToWidth(wifiInfoDetail(), w - 12), w / 2, h / 2 + 20);
+  M5.Display.setFont(&fonts::Font0);
+  if (wifiInfoIp().length()) {
+    M5.Display.drawString(fitTextToWidth(wifiInfoIp(), w - 12), w / 2, h / 2 + 31);
+  }
+  if (message == "Ready: Enter / Down") {
+    M5.Display.drawString("A: send", w / 2, h - 16);
+    M5.Display.drawString("B: down/hold", w / 2, h - 5);
+  } else {
+    M5.Display.drawString(fitTextToWidth(footerText(message), w - 12), w / 2, h - 10);
+  }
 
   lastConnected = connected;
   lastMessage = message;
